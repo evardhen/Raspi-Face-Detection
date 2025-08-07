@@ -3,24 +3,30 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
+import matplotlib.pyplot as plt
+from utils import CropBorders
 
-data_dir = "data"  # <-- change if needed
-num_epochs = 15
+data_dir = "data/images"  # Each person has own subfolder
+num_epochs = 10
 batch_size = 64
 img_size = 224
 lr = 3e-4
+plot_example = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Augmentation / normalization (ImageNet stats)
 train_tfms = transforms.Compose([
-    transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
-    transforms.RandomHorizontalFlip(),
+    CropBorders(top_ratio=1/3, side_ratio=1/4), 
+    transforms.Resize(img_size*1.15),
+    transforms.CenterCrop(img_size),
+    # transforms.RandomHorizontalFlip(),
     transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
     transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]), # Essential because MobileNet’s pre-training assumed this normalisation
 ])
 
 val_tfms = transforms.Compose([
+    CropBorders(top_ratio=1/3, side_ratio=1/4),
     transforms.Resize(int(img_size*1.15)),
     transforms.CenterCrop(img_size),
     transforms.ToTensor(),
@@ -34,6 +40,24 @@ train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuf
 val_loader   = torch.utils.data.DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 class_names = train_ds.classes
 num_classes = len(class_names)
+
+if plot_example:
+    # --- get one batch ---
+    images, labels = next(iter(train_loader))   # ← uses the DataLoader you already created
+    img, lbl = images[0], labels[0]
+
+    # --- un-normalise (+ image range back to 0-1) ---
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
+    std  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+    img_vis = img * std + mean          # undo Normalize
+    img_vis = img_vis.clamp(0,1)        # safety
+
+    # --- convert C×H×W → H×W×C and plot ---
+    img_np = img_vis.permute(1,2,0).cpu().numpy()
+    plt.imshow(img_np)
+    plt.title(class_names[lbl])
+    plt.axis('off')
+    plt.show()
 
 # Load pretrained MobileNetV3-Small
 weights = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
@@ -88,4 +112,4 @@ for epoch in range(num_epochs):
 print(f"Best val acc: {best_acc:.3f}")
 model.load_state_dict(best_wts)
 torch.save({"state_dict": model.state_dict(),
-            "classes": class_names}, "mobilenetv3_small_people.pt")
+            "classes": class_names}, "saves/mobilenetv3_small_people.pt")

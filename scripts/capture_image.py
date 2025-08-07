@@ -7,7 +7,7 @@ import RPi.GPIO as GPIO
 PIR_PIN = 27
 LED_PIN = 23
 INFRARET_LED_PIN = 25
-NUM_IMAGES = 3
+NUM_IMAGES = 5
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(PIR_PIN, GPIO.IN)
@@ -19,14 +19,14 @@ picam2 = Picamera2()
 picam2.configure(picam2.create_still_configuration())
 
 # Create directory to save images if it doesn't exist
-IMAGE_DIR = "/home/henri/Documents/Raspi-Face-Detection/images"
+IMAGE_DIR = "/home/henri/Documents/Raspi-Face-Detection/data/images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 # Start the camera
 picam2.start()
 
-def capture_image(image_count):
-    image_path = os.path.join(IMAGE_DIR, f"image_{image_count}.jpg")
+def capture_image(image_count, idx):
+    image_path = os.path.join(IMAGE_DIR, f"image_{image_count}_{idx}idx.jpg")
     picam2.capture_file(image_path)
     print(f"Captured {image_path}")
     
@@ -47,16 +47,16 @@ try:
         if GPIO.input(PIR_PIN):
             print("Motion detected!")
             GPIO.output(INFRARET_LED_PIN, GPIO.HIGH)
-            for _ in range(NUM_IMAGES):
-                time.sleep(0.3)
+            for i in range(NUM_IMAGES):
                 # Capture image
-                capture_image(image_count)
+                capture_image(image_count, i)
                 image_count += 1
+                time.sleep(0.8)
             time.sleep(1)
             GPIO.output(INFRARET_LED_PIN, GPIO.LOW)
         
         # Short delay to avoid multiple triggers
-        time.sleep(3)
+        time.sleep(10)
 
 except KeyboardInterrupt:
     print("Exiting program...")
