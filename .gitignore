@@ -1,3 +1,10 @@
 face_env/
 images/*
 audio_files/
+data/images
+.python-version
+pyproject.toml
+__pycache__/
+.venv/
+*.pyc
+uv.lock
