@@ -6,5 +6,5 @@ picam2.configure(picam2.create_still_configuration())
 
 # Start the camera, take a picture, and save it
 picam2.start()
-picam2.capture_file("/home/henri/Documents/Raspi-Face-Detection/images/test_pic.jpg")
+picam2.capture_file("/home/henri/Documents/Raspi-Face-Detection/data/images/test_pic.jpg")
 picam2.stop()
