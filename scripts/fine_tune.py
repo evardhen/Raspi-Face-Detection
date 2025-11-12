@@ -2,114 +2,99 @@ import os, copy, time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms, models
+from torchvision import datasets
 import matplotlib.pyplot as plt
-from utils import CropBorders
+from pathlib import Path
+import sys
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from utils import make_tfms, get_classes
+from utils.model_loader import load_model
 
 data_dir = "data/images"  # Each person has own subfolder
-num_epochs = 10
-batch_size = 64
-img_size = 224
+num_epochs = 15
+batch_size = 4
 lr = 3e-4
-plot_example = True
+plot_example = False
+model_type = "mobilefacenet"  # "mobilefacenet" or "arcface_r50"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Augmentation / normalization (ImageNet stats)
-train_tfms = transforms.Compose([
-    CropBorders(top_ratio=1/3, side_ratio=1/4), 
-    transforms.Resize(img_size*1.15),
-    transforms.CenterCrop(img_size),
-    # transforms.RandomHorizontalFlip(),
-    transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]), # Essential because MobileNet’s pre-training assumed this normalisation
-])
 
-val_tfms = transforms.Compose([
-    CropBorders(top_ratio=1/3, side_ratio=1/4),
-    transforms.Resize(int(img_size*1.15)),
-    transforms.CenterCrop(img_size),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
-])
+def main():
+    num_classes = len(get_classes())
+    model, img_size = load_model(model_type, num_classes)
+    model.to(device)
 
-train_ds = datasets.ImageFolder(os.path.join(data_dir, "train"), transform=train_tfms)
-val_ds   = datasets.ImageFolder(os.path.join(data_dir, "val"),   transform=val_tfms)
+    train_tfms = make_tfms(model_type=model_type, train=True, img_size=img_size)
+    val_tfms   = make_tfms(model_type=model_type, train=False, img_size=img_size)
 
-train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-val_loader   = torch.utils.data.DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-class_names = train_ds.classes
-num_classes = len(class_names)
+    train_ds = datasets.ImageFolder(os.path.join(data_dir, "train"), transform=train_tfms)
+    val_ds   = datasets.ImageFolder(os.path.join(data_dir, "val"),   transform=val_tfms)
 
-if plot_example:
-    # --- get one batch ---
-    images, labels = next(iter(train_loader))   # ← uses the DataLoader you already created
-    img, lbl = images[0], labels[0]
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True, drop_last=True)
+    val_loader   = torch.utils.data.DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True, drop_last=True)
+    class_names = train_ds.classes
+    print(f"Found {len(train_ds)} training images in {len(class_names)} classes")
+    # quick sanity check
+    print("model on:", next(model.parameters()).device)
 
-    # --- un-normalise (+ image range back to 0-1) ---
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
-    std  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
-    img_vis = img * std + mean          # undo Normalize
-    img_vis = img_vis.clamp(0,1)        # safety
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
-    # --- convert C×H×W → H×W×C and plot ---
-    img_np = img_vis.permute(1,2,0).cpu().numpy()
-    plt.imshow(img_np)
-    plt.title(class_names[lbl])
-    plt.axis('off')
-    plt.show()
+    best_acc, best_wts = 0.0, copy.deepcopy(model.state_dict())
 
-# Load pretrained MobileNetV3-Small
-weights = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
-model = models.mobilenet_v3_small(weights=weights)
+    def run_epoch(loader, train=True):
+        model.train(train)
+        epoch_loss, correct, total = 0.0, 0, 0
+        torch.set_grad_enabled(train)
+        for b, (images, labels) in enumerate(loader):
 
-# Replace classifier for our classes
-in_feats = model.classifier[3].in_features  # last Linear
-model.classifier[3] = nn.Linear(in_feats, num_classes)
+            if train and images.size(0) == 1:
+                print(f"[WARN] skipping batch {b}: batch_size=1 (BN unsafe)")
+                continue
+            images, labels = images.to(device), labels.to(device)
+            if train:
+                optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            if train:
+                loss.backward()
+                optimizer.step()
+            epoch_loss += loss.item() * images.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+        return epoch_loss/total, correct/total
 
-# Option A: fine-tune all layers (best if you have enough images)
-# Option B: freeze backbone for first epochs, then unfreeze:
-# for p in model.features.parameters():
-#     p.requires_grad = False
+    for epoch in range(num_epochs):
+        t0 = time.time()
+        tr_loss, tr_acc = run_epoch(train_loader, train=True)
+        val_loss, val_acc = run_epoch(val_loader,   train=False)
+        scheduler.step()
+        if val_acc > best_acc:
+            best_acc, best_wts = val_acc, copy.deepcopy(model.state_dict())
+        print(f"Epoch {epoch+1:02d}/{num_epochs} "
+            f"train loss: {tr_loss:.4f} train acc: {tr_acc:.3f}  val loss: {val_loss:.4f} val acc: {val_acc:.3f}  "
+            f"time {time.time()-t0:.1f}s")
 
-model.to(device)
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    print(f"Best val acc: {best_acc:.3f}")
+    model.load_state_dict(best_wts)
+    if model_type == "mobilefacenet":
+        torch.save({"state_dict": model.state_dict(),
+                    "classes": class_names}, "saves/mobilefacenet_people.pt")
+    elif model_type == "arcface_r50":
+        torch.save({"state_dict": model.state_dict(),
+                    "classes": class_names}, "saves/arcface_r50_people.pt")
+    elif model_type == "mobilenetv3_small":
+        torch.save({"state_dict": model.state_dict(),
+                    "classes": class_names}, "saves/mobilenetv3_small_people.pt")
+    
 
-best_acc, best_wts = 0.0, copy.deepcopy(model.state_dict())
 
-def run_epoch(loader, train=True):
-    model.train(train)
-    epoch_loss, correct, total = 0.0, 0, 0
-    torch.set_grad_enabled(train)
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        if train:
-            optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        if train:
-            loss.backward()
-            optimizer.step()
-        epoch_loss += loss.item() * images.size(0)
-        preds = outputs.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-    return epoch_loss/total, correct/total
-
-for epoch in range(num_epochs):
-    t0 = time.time()
-    tr_loss, tr_acc = run_epoch(train_loader, train=True)
-    val_loss, val_acc = run_epoch(val_loader,   train=False)
-    scheduler.step()
-    if val_acc > best_acc:
-        best_acc, best_wts = val_acc, copy.deepcopy(model.state_dict())
-    print(f"Epoch {epoch+1:02d}/{num_epochs} "
-          f"train {tr_loss:.4f}/{tr_acc:.3f}  val {val_loss:.4f}/{val_acc:.3f}  "
-          f"time {time.time()-t0:.1f}s")
-
-print(f"Best val acc: {best_acc:.3f}")
-model.load_state_dict(best_wts)
-torch.save({"state_dict": model.state_dict(),
-            "classes": class_names}, "saves/mobilenetv3_small_people.pt")
+if __name__ == "__main__":
+    print(f"Using device: {device}")
+    print("cuda in torch wheel:", torch.version.cuda)
+    print(f"Model type: {model_type}")
+    torch.multiprocessing.set_start_method("spawn", force=True)  # <— key line
+    main()
